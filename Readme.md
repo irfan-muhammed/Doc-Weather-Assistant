@@ -126,3 +126,31 @@ pytest -v
 ```
 All tests for the agent's router logic and the weather tool's API handling should pass.
 
+
+## 🔎 LangSmith Evaluation
+
+The agent's execution is fully traced in LangSmith. You can view the live, interactive traces for sample queries by clicking the links below. This allows for a detailed inspection of the agent's routing decisions and tool outputs.
+
+-   **[View RAG Query Trace](https://smith.langchain.com/public/ac0cfa8c-6519-49e0-884f-30434fed47de/r)** - *An example of the agent answering a question from the ISO document.*
+-   **[View Weather Query Trace](https://smith.langchain.com/public/e906910d-6a79-4422-ba43-1e1faf06b56d/r)** - *An example of the agent calling the weather API.*
+
+## ✅ Test Results
+
+The project passes all 4 unit tests, covering the agent's router logic and the weather tool's API handling.
+
+```
+$ pytest -v
+============================= test session starts ==============================
+platform win32 -- Python 3.12.6, pytest-8.2.0, pluggy-1.5.0 -- venv\Scripts\python.exe
+rootdir: C:\path\to\your\project
+plugins: mock-3.14.0
+collected 4 items
+
+tests/test_agent.py::test_router_node_routes_to_rag PASSED             [ 25%]
+tests/test_agent.py::test_router_node_routes_to_weather PASSED        [ 50%]
+tests/test_tools.py::test_fetch_weather_success PASSED                [ 75%]
+tests/test_tools.py::test_fetch_weather_city_not_found PASSED         [100%]
+
+============================== 4 passed in 1.23s ===============================
+```
+
