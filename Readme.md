@@ -19,7 +19,7 @@ This project was developed to demonstrate a comprehensive understanding of moder
 ## Tech Stack
 
 -   **Orchestration**: LangChain, LangGraph
--   **LLM & Embeddings**: Google Gemini (`gemini-1.5-flash`, `models/embedding-001`)
+-   **LLM & Embeddings**: Google Gemini (`gemini-2-flash`, `models/embedding-001`)
 -   **Vector Database**: Qdrant Cloud
 -   **UI**: Streamlit
 -   **Tools**: OpenWeatherMap API
@@ -125,3 +125,4 @@ To ensure all components are working correctly, run the unit tests from the root
 pytest -v
 ```
 All tests for the agent's router logic and the weather tool's API handling should pass.
+
