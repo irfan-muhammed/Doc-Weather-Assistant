@@ -1,0 +1,276 @@
+import os
+import asyncio
+import threading
+import pickle
+import warnings
+from pathlib import Path
+from dotenv import load_dotenv
+
+import streamlit as st
+# import nest_asyncio # Not strictly needed with the simplified async worker
+
+# LangChain and OpenAI setup
+from langchain_core.documents import Document as LCDocument
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+# >>>>>>>>>>>>>> OPENAI Imports <<<<<<<<<<<<<<
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings 
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool, Tool
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.runnables import RunnablePassthrough
+# Removed unused: langchain_community.chat_models import ChatOllama, langgraph.graph
+
+# --- Environment Setup (Simplified from original) ---
+
+warnings.filterwarnings("ignore")
+load_dotenv()
+
+# Configure OpenAI
+# Use os.getenv directly for api keys (expects OPENAI_API_KEY to be set)
+OPENAI_MODEL_NAME = "gpt-4-turbo" # Using a strong model for complex agentic reasoning
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+
+# Initialize LLM and Embeddings with OpenAI
+llm = ChatOpenAI(model=OPENAI_MODEL_NAME, temperature=0)
+embed_model = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+
+# Directories (Chroma will use the STORAGE_DIR)
+DATA_DIR = Path("DATAN")
+STORAGE_DIR = Path("storage_lc_openai") # New dir for OpenAI/Chroma
+SUMMARY_DIR = Path("summaries_lc_openai") # New dir for summaries
+DATA_DIR.mkdir(exist_ok=True)
+STORAGE_DIR.mkdir(exist_ok=True)
+SUMMARY_DIR.mkdir(exist_ok=True)
+
+# ChromaDB persistence setup
+CHROMA_PERSIST_DIR = str(STORAGE_DIR / "chroma_db_openai")
+
+# --- Sync Worker (Helper for Streamlit Threading) ---
+
+# This worker runs synchronous code in a thread to prevent Streamlit UI blockage
+class SyncWorker(threading.Thread):
+    def __init__(self, func, *args):
+        super().__init__()
+        self.func = func
+        self.args = args
+        self.result = None
+
+    def run(self):
+        self.result = self.func(*self.args)
+
+# --- Document Processing and Single Service Agent Builder ---
+
+TEXT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+def build_service_agent(doc: LCDocument, base: str):
+    """
+    Builds a LangChain/Chroma retrieval system and tool for a single UDS document.
+    """
+    
+    # 1. Chroma DB for Vector Storage (Vector Index equivalent)
+    chroma_collection_name = f"chroma_{base}"
+    
+    # Check if the vector store already exists (Chroma persistence check)
+    try:
+        vectorstore = Chroma(
+            collection_name=chroma_collection_name, 
+            persist_directory=CHROMA_PERSIST_DIR, 
+            embedding_function=embed_model
+        )
+        if not vectorstore._collection.count():
+             vectorstore = Chroma.from_documents(
+                [doc], 
+                embed_model, 
+                collection_name=chroma_collection_name, 
+                persist_directory=CHROMA_PERSIST_DIR
+            )
+        vectorstore.persist()
+    except Exception:
+        vectorstore = Chroma.from_documents(
+            [doc], 
+            embed_model, 
+            collection_name=chroma_collection_name, 
+            persist_directory=CHROMA_PERSIST_DIR
+        )
+        vectorstore.persist()
+
+    retriever = vectorstore.as_retriever()
+
+    # 2. Retrieval Chain (Vector Query Engine equivalent)
+    vector_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an expert on UDS service '{base}'. Use the provided context to answer the user's question. If you don't know the answer, just say you don't have enough information."),
+        ("user", "{input}")
+    ])
+    
+    document_chain = create_stuff_documents_chain(llm, vector_prompt.partial(base=base))
+    vqe_chain = create_retrieval_chain(retriever, document_chain)
+
+    # 3. Summary Generation
+    summary_out = SUMMARY_DIR / f"{base}.pkl"
+    if not summary_out.exists():
+        # Generate summary using the LLM directly on the full document text
+        summary_prompt = f"Summarize this UDS service in 1–2 lines. The service is:\n\n{doc.page_content[:2000]}..."
+        s = llm.invoke(summary_prompt).content
+        pickle.dump(str(s), open(summary_out, "wb"))
+    
+    summary = pickle.load(open(summary_out, "rb"))
+
+    # 4. Create the LangChain Tool
+    @tool(name=f"tool_{base}", description=f"Tool for semantic search within the {base} UDS service. {summary}")
+    def service_query_tool(query: str) -> str:
+        """Runs a semantic search query against the specific UDS service's document."""
+        response = vqe_chain.invoke({"input": query})
+        return response['answer']
+
+    return service_query_tool, summary
+
+# --- Main Agent Builder ---
+
+def init_agents():
+    """Initializes all single-service tools and the top-level ReAct agent."""
+    
+    # 1. Load documents
+    docs = []
+    for file in DATA_DIR.glob("*.txt"):
+        text = file.read_text(encoding='utf-8')
+        docs.append(LCDocument(page_content=text, metadata={"path": file.stem}))
+
+    # 2. Build Tools and Summaries for each service
+    service_tools = []
+    summaries = {}
+    for doc in docs:
+        base = doc.metadata["path"]
+        # Split document into chunks before passing to tool builder for initial storage
+        # Note: The split_documents call here isn't strictly necessary for the tool builder 
+        # but kept for consistency, though the tool builder only uses the full doc/metadata.
+        TEXT_SPLITTER.split_documents([doc]) 
+        tool, summary = build_service_agent(LCDocument(page_content=doc.page_content, metadata=doc.metadata), base)
+        service_tools.append(tool)
+        summaries[base] = summary
+
+    # 3. Baseline RAG setup
+    all_chunks = []
+    for doc in docs:
+        all_chunks.extend(TEXT_SPLITTER.split_documents([doc]))
+
+    # Use a separate Chroma collection for the baseline RAG
+    baseline_chroma_name = "chroma_baseline_openai"
+    baseline_vectorstore = Chroma.from_documents(
+        all_chunks, 
+        embed_model, 
+        collection_name=baseline_chroma_name, 
+        persist_directory=CHROMA_PERSIST_DIR
+    )
+    baseline_retriever = baseline_vectorstore.as_retriever(search_kwargs={"k": 4})
+    
+    # Baseline RAG Chain
+    baseline_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a general UDS expert. Use the provided context to answer the user's question."),
+        ("user", "{input}")
+    ])
+    baseline_document_chain = create_stuff_documents_chain(llm, baseline_prompt)
+    base_qe = create_retrieval_chain(baseline_retriever, baseline_document_chain)
+
+
+    # 4. Top-level Multi-Agent (ReAct AgentExecutor)
+    top_agent_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a UDS expert. Your task is to use the provided tools to answer the user's question. Select the correct tool(s) based on the service name or comparison need. Use only tools. Be concise."),
+        ("placeholder", "{agent_scratchpad}"),
+        ("user", "{input}")
+    ])
+
+    top_agent = create_react_agent(llm, service_tools, top_agent_prompt)
+    top_agent_executor = AgentExecutor(
+        agent=top_agent, 
+        tools=service_tools, 
+        verbose=True,
+        handle_parsing_errors=True
+    )
+
+    return top_agent_executor, base_qe
+
+# --- Streamlit UI ---
+
+st.set_page_config(page_title="UDS Chatbot", layout="wide")
+st.title("🚗 UDS Service Chatbot (LangChain/OpenAI/Chroma)")
+
+# File uploader
+uploaded_files = st.file_uploader("📁 Upload UDS service `.txt` files", type=["txt"], accept_multiple_files=True)
+if uploaded_files:
+    for uf in uploaded_files:
+        out_path = DATA_DIR / uf.name
+        with open(out_path, "wb") as f:
+            f.write(uf.getvalue())
+    st.success("✅ Files uploaded! Click 'Initialize Services' to build agents.")
+
+# Initialize button
+if st.button("Initialize Services"):
+    with st.spinner("🔧 Building indices and agents..."):
+        # Run initialization in a thread to prevent Streamlit from blocking
+        worker = SyncWorker(init_agents)
+        worker.start()
+        worker.join()
+        
+        top_agent, base_qe = worker.result
+        
+        st.session_state["top_agent"] = top_agent
+        st.session_state["base_qe"] = base_qe
+        st.session_state["history"] = []
+    st.success("✅ Initialization complete!")
+
+# Chat Interface
+if "top_agent" in st.session_state:
+
+    # Async function wrapper for Streamlit
+    async def query_agents(query):
+        
+        def run_sync_queries():
+            # Run Top Agent (Multi-agent reasoning)
+            res1_obj = st.session_state["top_agent"].invoke({"input": query})
+            res1 = res1_obj.get("output", "Error: No output from TopAgent.")
+            
+            # Run Baseline RAG
+            res2_obj = st.session_state["base_qe"].invoke({"input": query})
+            res2 = res2_obj.get("answer", "Error: No answer from Baseline RAG.")
+            
+            return res1, res2
+            
+        # Use an executor to run the synchronous calls in a background thread
+        loop = asyncio.get_event_loop()
+        res1, res2 = await loop.run_in_executor(None, run_sync_queries)
+        
+        return res1, res2
+
+    # Chat input
+    query = st.chat_input("💬 Ask about UDS services...")
+
+    if query:
+        st.session_state["history"].append(("user", query))
+        
+        # Need to use the event loop for the async function wrapper
+        try:
+            res1, res2 = asyncio.run(query_agents(query))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            res1, res2 = loop.run_until_complete(query_agents(query))
+        
+        st.session_state["history"].append(("top_agent", res1))
+        st.session_state["history"].append(("baseline", res2))
+
+    # Display history
+    for sender, msg in st.session_state["history"]:
+        if sender == "user":
+            with st.chat_message("user"):
+                st.markdown(msg)
+        elif sender == "top_agent":
+            with st.chat_message("assistant"):
+                st.markdown(f"🔹 **TopAgent (LangChain Multi-agent):**\n\n{msg}")
+        elif sender == "baseline":
+            with st.chat_message("assistant"):
+                st.markdown(f"🔸 **Baseline RAG:**\n\n{msg}")
+
+else:
+    st.info("⬆️ Please upload files and initialize services to start chatting.")
